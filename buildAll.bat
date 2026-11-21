@@ -1,4 +1,4 @@
-set version=1.01
+set version=1.02
 set dotnetcore=net5.0
 
 rem Root solution folder

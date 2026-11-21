@@ -18,6 +18,8 @@ namespace WatchCalendar
 {
     class Program
     {
+        private const string RunHeaderPrefix = "### RUN ";
+
         static List<string> prevLogLines = new List<string>();
         static List<string> newLogLines = new List<string>();
         private static int notificationsSend = 0;
@@ -33,8 +35,9 @@ namespace WatchCalendar
             FileIniDataParser fileIniDataParser = new FileIniDataParser();
             IniData settings = fileIniDataParser.ReadFile($@"{path}/Settings.ini");
 
-            string logFile = settings["General"]["logFile"];
-            if (Path.GetDirectoryName(logFile) == "") logFile = $"{path}/{logFile}";
+            string logFile = ResolvePath(path, settings["General"]["logFile"]);
+            string calendarOldFile = ResolvePath(path, settings["General"]["calendarOldFile"]);
+            string calendarNewFile = ResolvePath(path, settings["General"]["calendarNewFile"]);
 
             int maxLogEntriesToKeep = Convert.ToInt32(settings["General"]["maxLogEntriesToKeep"]);
             maxNotificationsPerRun = Convert.ToInt32(settings["PushNotification"]["maxNotificationsPerRun"]);
@@ -49,12 +52,12 @@ namespace WatchCalendar
 
             string apikey = settings["Pushover"]["apikey"].Trim();
             string userkey = settings["Pushover"]["userkey"].Trim();
-            List<string> devices = settings["Pushover"]["devices"].Split(",", StringSplitOptions.RemoveEmptyEntries).ToList(); //new List<string> {"iPhone6Jan"};//, "KirsteniPhone" };
+            List<string> devices = settings["Pushover"]["devices"].Split(",", StringSplitOptions.RemoveEmptyEntries).ToList();
 
             notificationAvailable = !(apikey == "" || userkey == "" || devices.Count <= 0);
             if (!notificationAvailable) LogMessage("Sending notifications is not available! Check you PushOver settings!");
 
-            string title = settings["PushNotification"]["title"]; //"Bonusfamilie agenda notificatie";
+            string title = settings["PushNotification"]["title"];
 
             bool sendNotificationsForAddedEvents = bool.Parse(settings["SendNotificationsFor"]["addedEvents"]);
             bool sendNotificationsForChangedEvents = bool.Parse(settings["SendNotificationsFor"]["changedEvents"]);
@@ -72,40 +75,31 @@ namespace WatchCalendar
                 return;
             }
 
-            string calendarData = LoadCalendarDataFromUrl(calendarUrl);
+            // Last run's "new" becomes this run's "old" so both files keep previous vs current state
+            if (File.Exists(calendarNewFile))
+                WriteSortedCalendarFile(calendarNewFile, calendarOldFile);
 
-            //LogMessage(calendarData,false,true);
+            DateTime now = DateTime.Now;
+            LogMessage($"Run started now at {now}");
+            LogMessage($"{RunHeaderPrefix}{now:O}", true, false, true);
+
+            prevLogLines = File.Exists(logFile) ? File.ReadAllLines(logFile).ToList() : new List<string>();
+
+            DateTime lastChecked;
+            Calendar prevCalendar = LoadPrevCalendar(calendarOldFile, out lastChecked, now);
+
+            string calendarData = LoadCalendarDataFromUrl(calendarUrl);
 
             Calendar calendarAll = Calendar.Load(calendarData);
             Calendar calendar = new Calendar();
 
-            //filter calender events/appointments on date
-            calendar.Events.AddRange(calendarAll.Events
+            //filter calender events/appointments on date; stable UID order for comparable files
+            calendar.Events.AddRange(SortEvents(calendarAll.Events
                 // only events from now minus X days
-                .Where(e => e.DtStart.AsSystemLocal.Date >= DateTime.Now.Date.Add(new TimeSpan(startLoadingAllAppointmentsFromXDaysAgo, 0, 0, 0)))
-                .ToList());
+                .Where(e => e.DtStart.AsSystemLocal.Date >= DateTime.Now.Date.Add(new TimeSpan(startLoadingAllAppointmentsFromXDaysAgo, 0, 0, 0)))));
 
-            CalendarSerializer serializer = new CalendarSerializer();
-            string serializedCalendar = serializer.SerializeToString(calendar);
-
-            LogMessage(serializedCalendar, true, false);
-
-            Calendar prevCalendar;
-
-            DateTime lastChecked;
-            DateTime now = DateTime.Now;
-            LogMessage($"Run started now at {now}");
-
-            //first entry in new log
-            LogMessage(now.ToString(), true, false, true); //last line in log is always the datetime when calendar was loaded
-
-            string prevCalendarData;
-
-            prevLogLines = File.ReadAllLines(logFile).ToList();
-
-            lastChecked = prevLogLines.Count > 0 ? Convert.ToDateTime(prevLogLines[0]) : now;
+            File.WriteAllText(calendarNewFile, new CalendarSerializer().SerializeToString(calendar));
             LogMessage($"Previous check at {lastChecked}");
-            prevCalendar = LoadPrevCalendarFromLog(out prevCalendarData) ? Calendar.Load(prevCalendarData) : new Calendar();
 
             LogMessage($"Events loaded from previous check: {prevCalendar.Events.Count}");
             LogMessage($"Events loaded now: {calendar.Events.Count}");
@@ -160,20 +154,76 @@ namespace WatchCalendar
 
             LogMessage("");
 
-            newLogLines = KeepMostRecentCalendarEntries(CombineLogs(newLogLines, prevLogLines), maxLogEntriesToKeep);
+            newLogLines = KeepMostRecentRuns(CombineLogs(newLogLines, prevLogLines), maxLogEntriesToKeep);
 
             File.WriteAllLines(logFile, newLogLines);
 
-            Console.WriteLine($"\nLogfile written to {logFile}");
-            //Console.ReadKey();
+            Console.WriteLine($"\nCalendar data written to {calendarNewFile} (new) and {calendarOldFile} (old)");
+            Console.WriteLine($"Logfile written to {logFile}");
         }
 
-        static List<string> KeepMostRecentCalendarEntries(List<string> log, int max)
+        static string ResolvePath(string basePath, string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath)) return filePath;
+            if (Path.GetDirectoryName(filePath) == "") return $"{basePath}/{filePath}";
+            return filePath;
+        }
+
+        static IEnumerable<CalendarEvent> SortEvents(IEnumerable<CalendarEvent> events)
+        {
+            return events
+                .OrderBy(e => e.Uid ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(e => e.RecurrenceId != null ? e.RecurrenceId.AsSystemLocal : DateTime.MinValue);
+        }
+
+        /// <summary>
+        /// Load calendar from sourcePath, sort events by UID, write to destinationPath.
+        /// Falls back to a raw copy if parsing fails.
+        /// </summary>
+        static void WriteSortedCalendarFile(string sourcePath, string destinationPath)
+        {
+            try
+            {
+                Calendar source = Calendar.Load(File.ReadAllText(sourcePath));
+                Calendar sorted = new Calendar();
+                sorted.Events.AddRange(SortEvents(source.Events));
+                File.WriteAllText(destinationPath, new CalendarSerializer().SerializeToString(sorted));
+            }
+            catch (Exception)
+            {
+                File.Copy(sourcePath, destinationPath, overwrite: true);
+            }
+        }
+
+        static Calendar LoadPrevCalendar(string calendarOldFile, out DateTime lastChecked, DateTime now)
+        {
+            lastChecked = now;
+
+            if (!File.Exists(calendarOldFile))
+                return new Calendar();
+
+            try
+            {
+                lastChecked = File.GetLastWriteTime(calendarOldFile);
+                string prevCalendarData = File.ReadAllText(calendarOldFile).Trim();
+                if (string.IsNullOrEmpty(prevCalendarData))
+                    return new Calendar();
+
+                return Calendar.Load(prevCalendarData);
+            }
+            catch (Exception)
+            {
+                lastChecked = now;
+                return new Calendar();
+            }
+        }
+
+        static List<string> KeepMostRecentRuns(List<string> log, int max)
         {
             int n = 0;
             for (int i = 0; i < log.Count; i++)
             {
-                if (log[i].Trim().ToUpper() == "END:VCALENDAR")
+                if (log[i].StartsWith(RunHeaderPrefix, StringComparison.Ordinal))
                 {
                     n++;
                     if (n == max)
@@ -187,40 +237,15 @@ namespace WatchCalendar
             return log;
         }
 
-        static bool LoadPrevCalendarFromLog(out string calendarData)
-        {
-            string s = "";
-            bool b = false;
-
-            if (prevLogLines.Count > 0)
-            {
-                b = true;
-
-                int i = 0;
-                try
-                {
-                    while (prevLogLines[i].Trim().ToUpper() != "BEGIN:VCALENDAR") i++;
-                    int j = i + 1;
-                    while (prevLogLines[j].Trim().ToUpper() != "END:VCALENDAR") j++;
-                    s = prevLogLines.GetRange(i, j - i + 1).AppendAll("\n");
-                }
-                catch (Exception)
-                {
-                    b = false;
-                }
-            }
-
-            calendarData = s;
-            return b;
-        }
-
         static void LogMessage(string message, bool writeToFile = true, bool printToConsole = true, bool firstEntry = false)
         {
             if (printToConsole) Console.WriteLine(message);
+            if (!writeToFile) return;
+
             if (!firstEntry)
-                newLogLines.AddRange(message.Split("\r\n"));
+                newLogLines.AddRange(message.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None));
             else
-                newLogLines.InsertRange(0, message.Split("\r\n")); ;
+                newLogLines.InsertRange(0, message.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None));
         }
 
         static List<String> CombineLogs(List<String> firstLog, List<String> secondLog)
