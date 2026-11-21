@@ -36,8 +36,9 @@ namespace WatchCalendar
             IniData settings = fileIniDataParser.ReadFile($@"{path}/Settings.ini");
 
             string logFile = ResolvePath(path, settings["General"]["logFile"]);
-            string calendarOldFile = ResolvePath(path, settings["General"]["calendarOldFile"]);
-            string calendarNewFile = ResolvePath(path, settings["General"]["calendarNewFile"]);
+            string calendarDataFile = ResolvePath(path, settings["General"]["calendarDataFile"]);
+            int maxCalendarFilesToKeep = Convert.ToInt32(settings["General"]["maxCalendarFilesToKeep"]);
+            if (maxCalendarFilesToKeep < 2) maxCalendarFilesToKeep = 2;
 
             int maxLogEntriesToKeep = Convert.ToInt32(settings["General"]["maxLogEntriesToKeep"]);
             maxNotificationsPerRun = Convert.ToInt32(settings["PushNotification"]["maxNotificationsPerRun"]);
@@ -75,9 +76,17 @@ namespace WatchCalendar
                 return;
             }
 
-            // Last run's "new" becomes this run's "old" so both files keep previous vs current state
-            if (File.Exists(calendarNewFile))
-                WriteSortedCalendarFile(calendarNewFile, calendarOldFile);
+            string calendarDir = Path.GetDirectoryName(calendarDataFile);
+            if (string.IsNullOrEmpty(calendarDir)) calendarDir = path;
+            string calendarBaseName = Path.GetFileNameWithoutExtension(calendarDataFile);
+            string calendarExt = Path.GetExtension(calendarDataFile);
+            if (string.IsNullOrEmpty(calendarExt)) calendarExt = ".ics";
+
+            string calendarNewFile = Path.Combine(calendarDir, $"{calendarBaseName}_new{calendarExt}");
+            string calendarOldFile = Path.Combine(calendarDir, $"{calendarBaseName}_old{calendarExt}");
+
+            // If only dated archives exist, promote the newest two to new/old
+            PromoteDatedSnapshotsToNewOld(calendarDir, calendarBaseName, calendarExt, calendarNewFile, calendarOldFile);
 
             DateTime now = DateTime.Now;
             LogMessage($"Run started now at {now}");
@@ -86,7 +95,8 @@ namespace WatchCalendar
             prevLogLines = File.Exists(logFile) ? File.ReadAllLines(logFile).ToList() : new List<string>();
 
             DateTime lastChecked;
-            Calendar prevCalendar = LoadPrevCalendar(calendarOldFile, out lastChecked, now);
+            Calendar prevCalendar = LoadPrevCalendar(
+                File.Exists(calendarNewFile) ? calendarNewFile : null, out lastChecked, now);
 
             string calendarData = LoadCalendarDataFromUrl(calendarUrl);
 
@@ -98,8 +108,13 @@ namespace WatchCalendar
                 // only events from now minus X days
                 .Where(e => e.DtStart.AsSystemLocal.Date >= DateTime.Now.Date.Add(new TimeSpan(startLoadingAllAppointmentsFromXDaysAgo, 0, 0, 0)))));
 
-            File.WriteAllText(calendarNewFile, new CalendarSerializer().SerializeToString(calendar));
+            RotateCalendarNewOld(calendarNewFile, calendarOldFile, calendarDir, calendarBaseName, calendarExt, maxCalendarFilesToKeep);
+            File.WriteAllText(calendarNewFile, SerializeCalendar(calendar));
+            PruneDatedCalendarFiles(calendarDir, calendarBaseName, calendarExt, maxCalendarFilesToKeep);
+
             LogMessage($"Previous check at {lastChecked}");
+            LogMessage($"Previous calendar file: {Path.GetFileName(calendarOldFile)}");
+            LogMessage($"Current calendar file: {Path.GetFileName(calendarNewFile)}");
 
             LogMessage($"Events loaded from previous check: {prevCalendar.Events.Count}");
             LogMessage($"Events loaded now: {calendar.Events.Count}");
@@ -158,9 +173,11 @@ namespace WatchCalendar
 
             File.WriteAllLines(logFile, newLogLines);
 
-            Console.WriteLine($"\nCalendar data written to {calendarNewFile} (new) and {calendarOldFile} (old)");
+            Console.WriteLine($"\nCalendar data written to {calendarNewFile} (previous run in {calendarOldFile})");
             Console.WriteLine($"Logfile written to {logFile}");
         }
+
+        private const string CalendarTimestampFormat = "yyyyMMdd_HHmmss";
 
         static string ResolvePath(string basePath, string filePath)
         {
@@ -176,36 +193,131 @@ namespace WatchCalendar
                 .ThenBy(e => e.RecurrenceId != null ? e.RecurrenceId.AsSystemLocal : DateTime.MinValue);
         }
 
-        /// <summary>
-        /// Load calendar from sourcePath, sort events by UID, write to destinationPath.
-        /// Falls back to a raw copy if parsing fails.
-        /// </summary>
-        static void WriteSortedCalendarFile(string sourcePath, string destinationPath)
+        static string SerializeCalendar(Calendar calendar)
         {
-            try
+            string serialized = new CalendarSerializer().SerializeToString(calendar) ?? "";
+            // Blank line between VEVENT blocks for easier manual comparison
+            return System.Text.RegularExpressions.Regex.Replace(
+                serialized,
+                @"(END:VEVENT)(\r?\n)(?=BEGIN:VEVENT)",
+                "$1$2$2");
+        }
+
+        /// <summary>
+        /// Dated archive files newest-first. Names: {base}_{yyyyMMdd_HHmmss}{ext} (not new/old).
+        /// </summary>
+        static List<string> ListDatedCalendarFiles(string directory, string baseName, string extension)
+        {
+            if (!Directory.Exists(directory))
+                return new List<string>();
+
+            string pattern = $"{baseName}_*{extension}";
+            return Directory.GetFiles(directory, pattern)
+                .Select(f => new { Path = f, Stamp = TryParseCalendarTimestamp(f, baseName, extension) })
+                .Where(x => x.Stamp.HasValue)
+                .OrderByDescending(x => x.Stamp.Value)
+                .Select(x => x.Path)
+                .ToList();
+        }
+
+        static DateTime? TryParseCalendarTimestamp(string filePath, string baseName, string extension)
+        {
+            string name = Path.GetFileName(filePath);
+            string prefix = baseName + "_";
+            if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                return null;
+            if (!name.EndsWith(extension, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            string stamp = name.Substring(prefix.Length, name.Length - prefix.Length - extension.Length);
+            if (stamp.Equals("new", StringComparison.OrdinalIgnoreCase) ||
+                stamp.Equals("old", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            if (DateTime.TryParseExact(stamp, CalendarTimestampFormat, null,
+                    System.Globalization.DateTimeStyles.None, out DateTime dt))
+                return dt;
+
+            return null;
+        }
+
+        /// <summary>
+        /// When new/old are missing but dated archives exist, promote the newest two.
+        /// </summary>
+        static void PromoteDatedSnapshotsToNewOld(string directory, string baseName, string extension,
+            string calendarNewFile, string calendarOldFile)
+        {
+            List<string> dated = ListDatedCalendarFiles(directory, baseName, extension);
+
+            if (!File.Exists(calendarNewFile) && dated.Count > 0)
             {
-                Calendar source = Calendar.Load(File.ReadAllText(sourcePath));
-                Calendar sorted = new Calendar();
-                sorted.Events.AddRange(SortEvents(source.Events));
-                File.WriteAllText(destinationPath, new CalendarSerializer().SerializeToString(sorted));
+                try { File.Move(dated[0], calendarNewFile); }
+                catch (Exception) { return; }
+                dated = ListDatedCalendarFiles(directory, baseName, extension);
             }
-            catch (Exception)
+
+            if (!File.Exists(calendarOldFile) && dated.Count > 0)
             {
-                File.Copy(sourcePath, destinationPath, overwrite: true);
+                try { File.Move(dated[0], calendarOldFile); }
+                catch (Exception) { /* ignore */ }
             }
         }
 
-        static Calendar LoadPrevCalendar(string calendarOldFile, out DateTime lastChecked, DateTime now)
+        /// <summary>
+        /// Archive current old (if keeping history), then move current new → old.
+        /// </summary>
+        static void RotateCalendarNewOld(string calendarNewFile, string calendarOldFile,
+            string directory, string baseName, string extension, int maxCalendarFilesToKeep)
+        {
+            if (File.Exists(calendarOldFile) && maxCalendarFilesToKeep > 2)
+            {
+                DateTime stamp = File.GetLastWriteTime(calendarOldFile);
+                string archivePath = Path.Combine(directory, $"{baseName}_{stamp.ToString(CalendarTimestampFormat)}{extension}");
+                while (File.Exists(archivePath))
+                {
+                    stamp = stamp.AddSeconds(1);
+                    archivePath = Path.Combine(directory, $"{baseName}_{stamp.ToString(CalendarTimestampFormat)}{extension}");
+                }
+                try { File.Move(calendarOldFile, archivePath); }
+                catch (Exception)
+                {
+                    try { File.Copy(calendarOldFile, archivePath, overwrite: true); }
+                    catch (Exception) { /* ignore archive failure */ }
+                }
+            }
+
+            if (File.Exists(calendarNewFile))
+            {
+                try { File.Copy(calendarNewFile, calendarOldFile, overwrite: true); }
+                catch (Exception) { /* ignore */ }
+            }
+        }
+
+        /// <summary>
+        /// Keep new+old plus dated archives up to maxCalendarFilesToKeep total.
+        /// </summary>
+        static void PruneDatedCalendarFiles(string directory, string baseName, string extension, int maxCalendarFilesToKeep)
+        {
+            int datedToKeep = Math.Max(0, maxCalendarFilesToKeep - 2);
+            List<string> dated = ListDatedCalendarFiles(directory, baseName, extension);
+            for (int i = datedToKeep; i < dated.Count; i++)
+            {
+                try { File.Delete(dated[i]); }
+                catch (Exception) { /* ignore prune failures */ }
+            }
+        }
+
+        static Calendar LoadPrevCalendar(string calendarFile, out DateTime lastChecked, DateTime now)
         {
             lastChecked = now;
 
-            if (!File.Exists(calendarOldFile))
+            if (string.IsNullOrEmpty(calendarFile) || !File.Exists(calendarFile))
                 return new Calendar();
 
             try
             {
-                lastChecked = File.GetLastWriteTime(calendarOldFile);
-                string prevCalendarData = File.ReadAllText(calendarOldFile).Trim();
+                lastChecked = File.GetLastWriteTime(calendarFile);
+                string prevCalendarData = File.ReadAllText(calendarFile).Trim();
                 if (string.IsNullOrEmpty(prevCalendarData))
                     return new Calendar();
 
@@ -255,6 +367,71 @@ namespace WatchCalendar
             return log;
         }
 
+        static string FormatRecurrence(CalendarEvent calendarEvent)
+        {
+            if (calendarEvent?.RecurrenceRules == null || calendarEvent.RecurrenceRules.Count == 0)
+                return null;
+
+            RecurrencePattern rule = calendarEvent.RecurrenceRules[0];
+            if (rule == null)
+                return null;
+
+            string frequency = FormatFrequency(rule);
+            if (frequency == null)
+                return null;
+
+            string text = frequency;
+
+            // Multiple BYDAY values: also show abbreviated weekdays
+            if (rule.ByDay != null && rule.ByDay.Count > 1)
+            {
+                string days = string.Join(", ", rule.ByDay.Select(d => FormatDayAbbrev(d.DayOfWeek)));
+                text = $"{frequency} {days}";
+            }
+
+            // UNTIL end date when present
+            if (rule.Until > DateTime.MinValue)
+                text = $"{text}, t/m {rule.Until.ToString("dd-MM-yyyy")}";
+
+            return text;
+        }
+
+        static string FormatFrequency(RecurrencePattern rule)
+        {
+            int interval = rule.Interval <= 0 ? 1 : rule.Interval;
+
+            switch (rule.Frequency)
+            {
+                case FrequencyType.Daily:
+                    return interval == 1 ? "dagelijks" : $"elke {interval} dagen";
+                case FrequencyType.Weekly:
+                    return interval == 1 ? "wekelijks" : $"elke {interval} weken";
+                case FrequencyType.Monthly:
+                    return interval == 1 ? "maandelijks" : $"elke {interval} maanden";
+                case FrequencyType.Yearly:
+                    return interval == 1 ? "jaarlijks" : $"elke {interval} jaar";
+                case FrequencyType.Hourly:
+                    return interval == 1 ? "elk uur" : $"elke {interval} uur";
+                default:
+                    return null;
+            }
+        }
+
+        static string FormatDayAbbrev(DayOfWeek day)
+        {
+            switch (day)
+            {
+                case DayOfWeek.Monday: return "ma";
+                case DayOfWeek.Tuesday: return "di";
+                case DayOfWeek.Wednesday: return "wo";
+                case DayOfWeek.Thursday: return "do";
+                case DayOfWeek.Friday: return "vr";
+                case DayOfWeek.Saturday: return "za";
+                case DayOfWeek.Sunday: return "zo";
+                default: return day.ToString();
+            }
+        }
+
         static string MakeMessage(CalendarEvent calendarEvent, string header)
         {
             DateTime dtStart = calendarEvent.DtStart.AsSystemLocal;
@@ -266,7 +443,12 @@ namespace WatchCalendar
             bool hasTime = calendarEvent.DtStart.HasTime || calendarEvent.DtEnd.HasTime;
             bool sameDay = hasTime ? dtEnd.Day == dtStart.Day : dtEnd.Day - 1 == dtStart.Day;
 
-            string s = $"{header} {calendarEvent.Summary}\n";
+            string recurrence = FormatRecurrence(calendarEvent);
+            string summary = string.IsNullOrEmpty(recurrence)
+                ? calendarEvent.Summary
+                : $"{calendarEvent.Summary} ({recurrence})";
+
+            string s = $"{header} {summary}\n";
 
             if (hasTime)
             {
